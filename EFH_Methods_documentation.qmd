@@ -1,0 +1,171 @@
+---
+title: "EFH Methods"
+author: "Ben Duffin"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 9)
+```
+
+```{r libs}
+library(readxl) 
+library(tidyverse) 
+library(ggplot2)
+library(ggmap)
+library(sf)
+library(leaflet)
+library(kableExtra)
+library(spatialEco) # need R version > 4.0 for latest package version
+library(raster) 
+
+
+
+```
+
+# A Quick Intro 
+
+This document is a concise description and example workflow of methods to delineate Essential Fish Habitat (EFH) using the preferred method identified in the 2023 EFH 5-Year Review. This includes weighting point data to be used in the kernel density estimation (KDE) algorithm. 
+
+This uses three datasets (though they aren't necessarily what we would use in producing EFH bounds): 
+
+* **Bluefin tuna DIVER** satelite data resulting from PSAT(?) tagged BFT 
+* **Adult bluefin captures** from survey(?) data (filename: `BFTaduQAQFINAL.csv`)
+* **Bluefin tuna from the POP** 
+
+For weighted kernel density estimation (KDE), one of a few packages. There are several options, but the `spatialEco` package seems to have a relatively easy way to implement all the things we'd like to do. [spatialEco documentation](https://cran.r-project.org/web/packages/spatialEco/spatialEco.pdf)
+
+```{r dat_load}
+# DIVER satelite data
+bftD <- read.csv("./data/DIVER/DIVER_Explorer_2021_07_22_Telemetry.csv", stringsAsFactors = F)
+# adult BFT 
+bftA <- read.csv("./data/BFTadu/BFTaduQAQCFINAL.csv", stringsAsFactors = F, encoding = "UTF-8")
+# BFT from POP data - lite preprocessing
+bftP <- read.csv('./data/POP_testBFT_2021-11-24.csv', stringsAsFactors = F)
+```
+
+We'll also load up some land: 
+``` {r spdat_load, echo = F}
+
+# basic coastline from Natural Earth 
+coastline <- st_read(dsn = "./data/North America Boundaries/ne_50m_land.shp")
+```
+
+And a quick plot after cropping it to a smaller extent: 
+
+```{r spdat_crop}
+# bounding box extent for the land 
+box <- c(xmin = -100, xmax = -25, ymin = -20, ymax = 55)
+coastline2 <- coastline %>% 
+  st_crop(box)
+
+ggplot(data = coastline2$geometry) + 
+  geom_sf()
+```
+
+
+## QAQC on all Data 
+Let's check for any oddball data. 
+
+* Missing data (modeling functions don't accept NA)
+* Non-numeric data in our geography fields
+* Duplicate data points
+
+
+Now digging into the lat/lon fields, some values stored as character. 
+``` {r qa2, include = F}
+# first the DIVER data - which looks pretty good 
+sapply(bftD[, c("Start_Latitude", "Start_Longitude")], function(x) summary(x))
+
+# then the POP data
+sapply(bftP[, c("latdec", "londec")], function(x) summary(x))
+
+# then the survey data
+sapply(bftA[, c("LATDEC", "LONDEC")], function(x) summary(x)) # why is LONDEC a character? should be numeric
+# see if we lose any data converting to numeric
+table(is.na(as.numeric(bftA$LONDEC))) # 2 - why? 
+
+# return rows with NA - looks like they contain #VALUE! (non-numeric)
+bftA %>% 
+  mutate(LONDEC_num = as.numeric(LONDEC)) %>%
+  filter(is.na(LONDEC_num)) 
+
+# convert anyway and remove these two rows
+bftA <- bftA %>% 
+  mutate(LONDEC = as.numeric(LONDEC)) %>% 
+  filter(!is.na(LONDEC))
+
+```
+
+
+We also need to clean up any errant data points like those on land. First, converting the data to `sf` objects to plot: 
+``` {r qax}
+# convert to sf
+bftD_sf <- st_as_sf(bftD, coords = c("Start_Longitude", "Start_Latitude"), crs = 4326)
+bftP_sf <- st_as_sf(bftP, coords = c("londec", "latdec"), crs = 4326)
+bftA_sf <- st_as_sf(bftA, coords = c("LONDEC", "LATDEC"), crs = 4326)
+```
+
+Then removing any points on land:
+``` {r id_land, message = F}
+# are there points on land? 
+bftA_onland <- sapply(st_intersects(bftA_sf, coastline), function(x) length(x) == 1)
+table(bftA_onland) # TRUE for 445?
+
+# for this example, we'll just cut those out of the data
+bftA_sf <- bftA_sf[!bftA_onland, ]
+
+```
+
+Similarly for the DIVER data: 
+``` {r id_land2}
+# are there points on land? 
+bftD_onland <- sapply(st_intersects(bftD_sf, coastline), function(x) length(x) == 1)
+table(bftD_onland) # 20 TRUE
+
+# for this example, we'll just cut those out of the data
+bftD_sf <- bftD_sf[!bftD_onland, ]
+
+```
+
+And the POP data: 
+``` {r id_land3, message = F}
+# are there points on land? 
+bftP_onland <- sapply(st_intersects(bftP_sf, coastline), function(x) length(x) == 1)
+table(bftP_onland) # all F, good 
+
+# for this example, we'll just cut those out of the data
+bftP_sf <- bftP_sf[!bftP_onland, ]
+
+```
+
+Now let's do a quick check to see if duplicated locations are present. 
+
+``` {r dupecheck}
+table(duplicated(bftA_sf$geometry)) # 5.1k true 
+table(duplicated(bftD_sf$geometry)) # 5 true
+table(duplicated(bftP_sf$geometry)) # 2.8k true
+
+```
+
+We will keep the dupes for the time being. 
+
+
+# Weight Generation
+To give a more even playing field for all the data sets, we'd want to set up weights based on the number of obsevations from each dataset. The package `adehabitatHR` doesn't allow for including weights in the kernel function. We can test out the `spatialEco` package function `spkde()` which does allow weights and at face value seems to be capable of performing the same analysis as `adehabitatHR`. Another function to explore would be the `density` function from the `spatstat` package, which also allows for inclusion of anisotropic smoothing kernel. 
+
+(*A note: need to upgrade R to version >= 4.0 for the latest version of* `spatialEco`)
+
+## Options
+
+I'm thinking of a scheme that would up-weight data that has a lower $n$. 
+To generate weights, we'd want to look at the all of the combined datasets for a species/lifestage and generate a weight to apply across all of the points from a particular dataset using: 
+$$W_d = \frac{1}{n_d/n_t}$$
+Where $W_d$ is the weight for the data source, $n_d$ is the number of observations from each dataset, and $n_t$ is the total number of observations. Simply, the inverse of the percent of data coming from each data source is it's weight. 
+
+Alternatively, we could weight the data to the largest data set:
+$$W_d = \frac{1}{n_d/n_m}$$
+Where $n_m$ is the number of observations from the largest dataset. This would not upweight the largest data set.
